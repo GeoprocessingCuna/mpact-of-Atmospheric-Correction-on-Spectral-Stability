@@ -1,0 +1,110 @@
+// ============================================================================
+// PROJECT: IMPACT OF ATMOSPHERIC CORRECTION ON SPECTRAL STABILITY
+// STEP 03: Cloud-Based Image Processing Pipeline and Zonal Stat Extraction (GEE)
+// AUTHOR: Inácio Samuel Cuna | UFV / IIAM
+// REPOSITORY: @GeoprocessingCuna
+// ============================================================================
+
+// 1. IMPORT REGION OF INTEREST (ROI) ----------------------------------------
+// Loads the vector asset matching the 1.34 ha commercial coffee field geometry
+var roi = ee.FeatureCollection('users/cunainacio/cafe_vicosa');
+Map.centerObject(roi, 18);
+Map.addLayer(roi.style({color: 'FF0000', fillColor: 'FF000022', width: 2}), {}, 'Coffee Plot Boundary');
+
+// 2. PREPARE SENTINEL-2 COLLECTIONS (0-1 SCALE & BILINEAR RESAMPLING) --------
+var bandas20m = ['B5', 'B6', 'B7', 'B8A', 'B11', 'B12'];
+var todasBandas = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12'];
+
+var prepareImage = function(img) {
+  // Divides by 10000 to convert digital numbers to dimensionless reflectance scale (0 to 1)
+  var rfl = img.select(todasBandas).divide(10000); 
+  
+  // Applies bilinear interpolation to resample 20m native bands into 10m spatial resolution
+  var resampled = rfl.select(bandas20m).resample('bilinear'); 
+  
+  return rfl.addBands(resampled, bandas20m, true)
+            .copyProperties(img, ['system:time_start', 'CLOUDY_PIXEL_PERCENTAGE']);
+};
+
+// Filters and maps image pre-processing functions across both radiometric levels
+var s2_L2A = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED').filterBounds(roi).map(prepareImage);
+var s2_L1C = ee.ImageCollection('COPERNICUS/S2').filterBounds(roi).map(prepareImage);
+
+// 3. QUARTERLY MEDIAN COMPOSITING AND SPATIAL REDUCTION FUNCTION ------------
+function getPhenologicalMedians(collection, startDate, endDate, season, phenology, level, cropYear) {
+  // Sorts images by lowest cloud cover percentage within the specific temporal window
+  var sortedCollection = collection.filterDate(startDate, endDate).sort('CLOUDY_PIXEL_PERCENTAGE');
+  var cleanestScenes = sortedCollection.limit(3); // Targets the top 3 cleanest scenes per period
+  
+  var meanCloud = cleanestScenes.aggregate_mean('CLOUDY_PIXEL_PERCENTAGE');
+  var medianImage = cleanestScenes.median();
+  
+  // Zonal Stats Reducer: Computes the spatial mean across the entire 1.34 ha field geometry
+  // Essential data constraint step to fully mitigate spatial pseudoreplication errors
+  var spatialMean = medianImage.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: roi,
+    scale: 10,
+    maxPixels: 1e9
+  });
+  
+  return ee.Feature(null, spatialMean)
+           .set('Safra', cropYear)
+           .set('Estacao', season)
+           .set('Fase_Fenologica_Aproximada', phenology)
+           .set('Nivel_Processamento', level)
+           .set('Nuvens_Pct', meanCloud);
+}
+
+// 4. CHRONONOLOGICAL STRUCTURE OF AGRICULTURAL CROPS (TRIENNIUM 2023 - 2026) -
+var featureList = [];
+var safras = [
+  {
+    cropYear: 'Safra_2023_2024',
+    periods: [
+      {season: 'Primavera', pheno: 'Florada_e_Chumbinho',    ini: '2023-09-23', fim: '2023-12-20'},
+      {season: 'Verao',     pheno: 'Granacao_e_Maturacao',   ini: '2024-01-01', fim: '2024-03-20'},
+      {season: 'Outono',    pheno: 'Maturacao_e_Colheita',   ini: '2024-03-21', fim: '2024-06-20'},
+      {season: 'Inverno',   pheno: 'Repouso_e_Diferenciacao',ini: '2024-06-21', fim: '2024-09-22'}
+    ]
+  },
+  {
+    cropYear: 'Safra_2024_2025',
+    periods: [
+      {season: 'Primavera', pheno: 'Florada_e_Chumbinho',    ini: '2024-09-23', fim: '2024-12-20'},
+      {season: 'Verao',     pheno: 'Granacao_e_Maturacao',   ini: '2025-01-01', fim: '2025-03-20'},
+      {season: 'Outono',    pheno: 'Maturacao_e_Colheita',   ini: '2025-03-21', fim: '2025-06-20'},
+      {season: 'Inverno',   pheno: 'Repouso_e_Diferenciacao',ini: '2025-06-21', fim: '2025-09-22'}
+    ]
+  },
+  {
+    cropYear: 'Safra_2025_2026',
+    periods: [
+      {season: 'Primavera', pheno: 'Florada_e_Chumbinho',    ini: '2025-09-23', fim: '2025-12-20'},
+      {season: 'Verao',     pheno: 'Granacao_e_Maturacao',   ini: '2026-01-01', fim: '2026-03-20'},
+      {season: 'Outono',    pheno: 'Maturacao_e_Colheita',   ini: '2026-03-21', fim: '2026-06-20'},
+      // Strictly calibrated to capture multi-spectral imagery up to present date (14/08/2026)
+      {season: 'Inverno',   pheno: 'Repouso_e_Diferenciacao',ini: '2026-06-21', fim: '2026-08-14'}
+    ]
+  }
+];
+
+// Iterates across crops and periods to populate the feature array
+safras.forEach(function(safra) {
+  safra.periods.forEach(function(p) {
+    featureList.push(getPhenologicalMedians(s2_L2A, p.ini, p.fim, p.season, p.pheno, 'L2A', safra.cropYear));
+    featureList.push(getPhenologicalMedians(s2_L1C, p.ini, p.fim, p.season, p.pheno, 'L1C', safra.cropYear));
+  });
+});
+
+var finalDataset = ee.FeatureCollection(featureList);
+print('Dataset Compiled and Ready for Cloud Exportation:', finalDataset.limit(5));
+
+// 5. EXPORT CONSOLIDATED GEODATABASE TO GOOGLE DRIVE ------------------------
+Export.table.toDrive({
+  collection: finalDataset,
+  description: 'Cafe_Vicosa_Safra_Correto',
+  folder: 'SIMEA',
+  fileFormat: 'CSV',
+  selectors: ['Safra', 'Estacao', 'Fase_Fenologica_Aproximada', 'Nivel_Processamento', 'Nuvens_Pct', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12']
+});
