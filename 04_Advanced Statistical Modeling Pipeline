@@ -1,0 +1,197 @@
+# ============================================================================
+# PROJECT: IMPACT OF ATMOSPHERIC CORRECTION ON SPECTRAL STABILITY
+# STEP 04: Advanced Statistical Modeling Pipeline (GLMM, MQO, and Tukey)
+# AUTHOR: Inácio Samuel Cuna | UFV / IIAM
+# REPOSITORY: @GeoprocessingCuna
+# ============================================================================
+
+# 1. LOAD REQUIRED LIBRARIES -------------------------------------------------
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggsci)
+library(nlme)
+library(emmeans)
+library(multcomp)
+library(Metrics)
+
+# Loads the clean cloud-derived database exported from GEE
+dados <- read.csv("Cafe_Vicosa_Safra_Correto.csv")
+
+# 2. INITIAL EXPLORATORY DATA ANALYSIS (EDA) ---------------------------------
+cat("\n--- DATA DATABASE STRUCTURE ---\n")
+str(dados)
+
+cat("\n--- RAW SATELLITE REFLECTANCE SUMMARY ---\n")
+summary(dados)
+
+cat("\n--- FACTORIAL EXPALNATION BALANCE ---\n")
+table(dados$Safra)
+table(dados$Estacao)
+table(dados$Nivel_Processamento)
+
+# 3. DATA RESTRUCTURING (COMPACT LONG FORMAT) ---------------------------------
+dados_longo <- dados %>%
+  pivot_longer(
+    cols = c(B2, B3, B4, B5, B6, B7, B8, B8A, B11, B12), 
+    names_to = "Banda", 
+    values_to = "Reflectancia"
+  ) %>%
+  mutate(
+    # Establishes chronological sequence along the optical spectrum
+    Banda = factor(Banda, levels = c('B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12')),
+    
+    # CRITICAL ADJUSTMENT: Maps standard civil seasons into biological coffee stages
+    Fase_Fenologica = case_when(
+      Estacao == "Primavera" ~ "Flowering & Pinhead",
+      Estacao == "Verao"     ~ "Graining & Expansion",
+      Estacao == "Outono"    ~ "Cherry Maturation",
+      Estacao == "Inverno"   ~ "Harvest & Dormancy"
+    ),
+    Fase_Fenologica = factor(Fase_Fenologica, levels = c("Flowering & Pinhead", "Graining & Expansion", 
+                                                         "Cherry Maturation", "Harvest & Dormancy")),
+    
+    # Formats process levels and specific crop years as steady factors
+    Nivel_Processamento = factor(Nivel_Processamento, levels = c('L1C', 'L2A')),
+    Safra = factor(Safra, levels = c('Safra_2023_2024', 'Safra_2024_2025', 'Safra_2025_2026'),
+                   labels = c('Crop Year 2023/24', 'Crop Year 2024/25', 'Crop Year 2025/26'))
+  )
+
+cat("\n--- LONG FORMAT COMPACT MATRIX STRUCTURE ---\n")
+str(dados_longo)
+
+# 4. QUANTIFY ATMOSPHERIC ATTENUATION MAGNITUDES (REVIEWER 2 - ITEM 2) -------
+dados_pareados <- dados_longo %>%
+  dplyr::select(Safra, Fase_Fenologica, Banda, Nivel_Processamento, Reflectancia) %>%
+  pivot_wider(
+    names_from = Nivel_Processamento, 
+    values_from = Reflectancia
+  ) %>%
+  mutate(
+    Absolute_Deviation = L1C - L2A,
+    Percentage_Reduction = ((L1C - L2A) / L1C) * 100
+  )
+
+tabela_magnitude_atmosferica <- dados_pareados %>%
+  group_by(Banda) %>%
+  summarise(
+    Mean_L1C = mean(L1C),
+    Mean_L2A = mean(L2A),
+    Mean_Absolute_Deviation = mean(Absolute_Deviation),
+    Mean_Percentage_Reduction = mean(Percentage_Reduction),
+    .groups = "drop"
+  )
+
+cat("\n=======================================================\n")
+cat("  ATMOSPHERIC ATTENUATION MAGNITUDE METRICS TABLE (BOA vs TOA) \n")
+cat("=======================================================\n")
+print(tabela_magnitude_atmosferica, row.names = FALSE)
+
+# 5. EXECUTE REPEATED MEASURES MIXED MODELS [AR(1)] PER BAND -----------------
+# Isolates clean surface reflectance data (L2A) to run unbiased models
+dados_anova_L2A <- dados_longo %>% filter(Nivel_Processamento == "L2A")
+bandas_lista <- levels(dados_anova_L2A$Banda)
+
+cat("\n=======================================================\n")
+cat("   INDEPENDENT GLMM ANOVA & ASSUMPTION DIAGNOSTICS      \n")
+cat("=======================================================\n")
+
+tabela_pvalores <- data.frame()
+
+for (b in bandas_lista) {
+  dados_b <- dados_anova_L2A %>% filter(Banda == b)
+  
+  # GLMM setup: Fixed phenology effect embedded with cross-year random AR(1) temporal memory
+  modelo_misto_b <- lme(
+    fixed = Reflectancia ~ Fase_Fenologica,
+    random = ~ 1 | Safra,
+    correlation = corAR1(form = ~ 1 | Safra),
+    data = dados_b
+  )
+  
+  # Extracts normalized residuals to validate regression assumptions
+  residuos_b <- residuals(modelo_misto_b, type = "normalized")
+  shapiro_b <- shapiro.test(residuos_b)
+  anova_b <- anova(modelo_misto_b)
+  
+  pval_fenologia <- anova_b$`p-value`[2]
+  pval_shapiro <- shapiro_b$p.value
+  
+  res_b <- data.frame(Banda = b, P_Value_Phenology = pval_fenologia, P_Value_Shapiro = pval_shapiro)
+  tabela_pvalores <- rbind(tabela_pvalores, res_b)
+}
+
+print(tabela_pvalores %>% mutate(
+  Phenological_Significance = if_else(P_Value_Phenology < 0.05, "Significant (*)", "Non-Significant (ns)"),
+  Normality_Assumption = if_else(P_Value_Shapiro > 0.05, "Passed (Normal)", "Violated")
+))
+
+# 6. POST-HOC TUKEY PAIRWISE MULTIPLE COMPARISONS (GLMM BLINDING) -------------
+# Subsets exclusively the highly significant radiometric bands
+bandas_significativas <- c("B7", "B8", "B8A")
+
+cat("\n=======================================================\n")
+cat(" TUKEY CONTRASTS FOR PHENOLOGICAL STAGES ACROSS KEY BANDS \n")
+cat("=======================================================\n")
+
+for (b in bandas_significativas) {
+  dados_b <- dados_anova_L2A %>% filter(Banda == b)
+  
+  modelo_misto_b <- lme(
+    fixed = Reflectancia ~ Fase_Fenologica,
+    random = ~ 1 | Safra,
+    correlation = corAR1(form = ~ 1 | Safra),
+    data = dados_b
+  )
+  
+  medias_fenologia <- emmeans(modelo_misto_b, specs = ~ Fase_Fenologica)
+  contrastes_tukey <- pairs(medias_fenologia, adjust = "tukey")
+  
+  cat(paste0("\n--- TUKEY PAIRWISE CONTRASTS FOR BAND ", b, " ---\n"))
+  print(contrastes_tukey)
+}
+
+# 7. CHART 1: MULTI-PANEL CALIBRATION PROFILE (TOA vs BOA) PER CROP YEAR -----
+resumo_grafico1 <- dados_longo %>%
+  group_by(Safra, Nivel_Processamento, Banda) %>%
+  summarise(Media = mean(Reflectancia), .groups = "drop")
+
+plot_perfil_calibracao <- ggplot(resumo_grafico1, aes(x = Banda, y = Media, group = Nivel_Processamento, color = Nivel_Processamento)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_grid(. ~ Safra) +
+  scale_color_manual(values = c("L1C" = "#1f77b4", "L2A" = "#d62728"), name = "Radiometric Level") +
+  labs(
+    x = "Spectral Bands (Sentinel-2 MSI Sensor)",
+    y = "Reflectance Factor (0 to 1)",
+    title = "Continuous Impact of Atmospheric Correction Across Crop Years",
+    subtitle = "Direct baseline comparison between raw Top-of-Atmosphere (L1C) and corrected surface (L2A) datasets"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), strip.background = element_rect(fill = "grey95"), 
+        strip.text = element_text(face = "bold"), legend.position = "bottom")
+
+print(plot_perfil_calibracao)
+
+# 8. CHART 2: MULTI-PANEL PHENOLOGICAL TRACKING INTERACTION (L2A ONLY) -------
+plot_fenologia_safra <- ggplot(dados_anova_L2A, aes(x = Banda, y = Reflectancia, group = Fase_Fenologica, color = Fase_Fenologica)) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  geom_point(size = 2) +
+  facet_grid(. ~ Safra) +
+  scale_color_npg(name = "Coffee Phenological Stage") +
+  labs(
+    x = "Spectral Bands (Sentinel-2 Surface Reflectance - Level L2A)",
+    y = "Surface Reflectance Factor (0 to 1)",
+    title = "Spectral Signature Evolution Across Crop Years and Phenological Stages",
+    subtitle = "Zonal mean canopy mapping clean of spatial pseudoreplication errors and atmospheric noise"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey95"),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+print(plot_fenologia_safra)
